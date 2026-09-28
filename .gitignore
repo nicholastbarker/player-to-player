@@ -1,0 +1,21 @@
+# Python virtual environment
+.venv/
+
+# Downloaded football data
+data/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# IDE
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
