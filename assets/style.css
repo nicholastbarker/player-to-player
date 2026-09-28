@@ -187,6 +187,39 @@ button:disabled {
     min-height: 42px;
 }
 
+/* Difficulty selector in the header */
+.difficulty-control {
+    min-width: 170px;
+}
+
+.difficulty-label {
+    margin-bottom: 4px;
+    font-size: 10px;
+    font-weight: 800;
+    letter-spacing: 1px;
+    color: rgba(255, 255, 255, 0.78);
+}
+
+.difficulty-dropdown {
+    min-width: 170px;
+    color: #0d2438;
+}
+
+.difficulty-dropdown .Select-control {
+    min-height: 42px;
+}
+
+/* Searchable club dropdown */
+.guess-dropdown {
+    flex: 1;
+    min-width: 0;
+}
+
+.guess-dropdown .Select-control {
+    min-height: 42px;
+}
+
+
 @media (max-width: 900px) {
     .main-grid {
         grid-template-columns: 1fr;

@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+from bisect import bisect_right
 from collections import defaultdict
 from dataclasses import dataclass
+from datetime import date
+import math
 import random
 import time
-from typing import Dict, Iterable
+from typing import Dict
 
 from football_data import CareerIndex
 
@@ -16,29 +19,14 @@ def node_id(row: int, col: int) -> str:
     return f"r{row}c{col}"
 
 
-NODES = [
-    node_id(r, c)
-    for r, length in enumerate(ROW_LENGTHS)
-    for c in range(length)
-]
+NODES = [node_id(r, c) for r, length in enumerate(ROW_LENGTHS) for c in range(length)]
 
 
 def build_edges() -> list[tuple[str, str]]:
-    """
-    1-2-3-4-3-2-1 triangular/diamond topology.
-
-    Expanding row:
-      parent c -> child c and c+1
-
-    Contracting row:
-      child c <- parent c and c+1
-    """
     edges: list[tuple[str, str]] = []
-
     for r in range(len(ROW_LENGTHS) - 1):
         a = ROW_LENGTHS[r]
         b = ROW_LENGTHS[r + 1]
-
         if b == a + 1:
             for c in range(a):
                 edges.append((node_id(r, c), node_id(r + 1, c)))
@@ -49,7 +37,6 @@ def build_edges() -> list[tuple[str, str]]:
                 edges.append((node_id(r, c + 1), node_id(r + 1, c)))
         else:
             raise ValueError("Unexpected row shape")
-
     return edges
 
 
@@ -79,12 +66,198 @@ class GenerationTimeout(RuntimeError):
     pass
 
 
+def edge_key(a: str, b: str) -> str:
+    return "|".join(sorted((a, b)))
+
+
+VALID_DIFFICULTIES = {"random", "easy", "medium", "difficult"}
+
+
+@dataclass
+class DifficultyProfile:
+    player_relevance: Dict[int, float]  # 0 obscure -> 100 famous/relevant
+    club_prestige: Dict[int, float]     # 0 obscure -> 100 prestigious
+
+    def edge_difficulty(
+        self,
+        index: CareerIndex,
+        player_a: int,
+        player_b: int,
+        club_id: int,
+    ) -> float:
+        club_obscurity = 100.0 - self.club_prestige.get(club_id, 0.0)
+        pair_relevance = (
+            self.player_relevance.get(player_a, 0.0)
+            + self.player_relevance.get(player_b, 0.0)
+        ) / 2.0
+        pair_obscurity = 100.0 - pair_relevance
+
+        # More career clubs = more plausible answers = harder link.
+        career_breadth = (
+            len(index.clubs_by_player.get(player_a, ()))
+            + len(index.clubs_by_player.get(player_b, ()))
+        )
+        breadth_score = min(100.0, max(0.0, (career_breadth - 4) / 14 * 100.0))
+
+        return (
+            0.50 * club_obscurity
+            + 0.25 * pair_obscurity
+            + 0.25 * breadth_score
+        )
+
+
+def _percentiles(values: dict[int, float]) -> dict[int, float]:
+    if not values:
+        return {}
+    ordered = sorted(values.values())
+    if len(ordered) == 1:
+        return {next(iter(values)): 100.0}
+    n = len(ordered)
+    return {
+        key: (bisect_right(ordered, value) - 1) / (n - 1) * 100.0
+        for key, value in values.items()
+    }
+
+
+def _parse_date(value) -> date | None:
+    if not value:
+        return None
+    try:
+        return date.fromisoformat(str(value)[:10])
+    except ValueError:
+        return None
+
+
+def build_difficulty_profile(index: CareerIndex) -> DifficultyProfile:
+    """
+    Offline relevance model using data already in the project:
+      50% peak market-value percentile
+      30% senior-appearance percentile
+      20% recency
+    Then a 20% career-club prestige boost is blended into the final score.
+    """
+    cached = getattr(index, "_ptp_difficulty_profile", None)
+    if cached is not None:
+        return cached
+
+    market_raw = {}
+    appearances_raw = {}
+    recency = {}
+    today = date.today()
+
+    for pid, info in index.player_info.items():
+        market = float(info.get("highest_market_value_in_eur", 0) or 0)
+        apps = float(info.get("senior_appearances", 0) or 0)
+        market_raw[pid] = math.log1p(max(0.0, market))
+        appearances_raw[pid] = math.log1p(max(0.0, apps))
+
+        last = _parse_date(info.get("last_appearance"))
+        if last is None:
+            recency[pid] = 0.0
+        else:
+            age_years = max(0.0, (today - last).days / 365.2425)
+            recency[pid] = max(0.0, 100.0 * (1.0 - min(age_years, 20.0) / 20.0))
+
+    market_pct = _percentiles(market_raw)
+    apps_pct = _percentiles(appearances_raw)
+
+    base = {
+        pid: (
+            0.50 * market_pct.get(pid, 0.0)
+            + 0.30 * apps_pct.get(pid, 0.0)
+            + 0.20 * recency.get(pid, 0.0)
+        )
+        for pid in index.player_info
+    }
+
+    club_prestige = {}
+    for cid, player_ids in index.players_by_club.items():
+        scores = sorted(
+            (base.get(pid, 0.0) for pid in player_ids),
+            reverse=True,
+        )
+        top = scores[:8]
+        club_prestige[cid] = sum(top) / len(top) if top else 0.0
+
+    relevance = {}
+    for pid in index.player_info:
+        best_club = max(
+            (club_prestige.get(cid, 0.0) for cid in index.clubs_by_player.get(pid, ())),
+            default=0.0,
+        )
+        relevance[pid] = 0.80 * base.get(pid, 0.0) + 0.20 * best_club
+
+    profile = DifficultyProfile(relevance, club_prestige)
+    setattr(index, "_ptp_difficulty_profile", profile)
+    return profile
+
+
+def _target(difficulty: str) -> float | None:
+    # Challenge score: 0 = very easy, 100 = very hard
+    return {
+        "random": None,
+        "easy": 22.0,
+        "medium": 50.0,
+        "difficult": 78.0,
+    }[difficulty]
+
+
+def _candidate_challenge(
+    index: CareerIndex,
+    profile: DifficultyProfile,
+    player_id: int,
+    assigned_neighbors: list[str],
+    assigned: dict[str, int],
+    shared_clubs: list[int],
+) -> float:
+    obscurity = 100.0 - profile.player_relevance.get(player_id, 0.0)
+    if not assigned_neighbors:
+        return obscurity
+
+    edge_scores = []
+    for neighbour, cid in zip(assigned_neighbors, shared_clubs):
+        edge_scores.append(
+            profile.edge_difficulty(
+                index,
+                player_id,
+                assigned[neighbour],
+                cid,
+            )
+        )
+    mean_edge = sum(edge_scores) / len(edge_scores)
+    return 0.65 * obscurity + 0.35 * mean_edge
+
+
+def score_completed_puzzle(
+    index: CareerIndex,
+    profile: DifficultyProfile,
+    players: dict[str, int],
+    edge_clubs: dict[str, int],
+) -> float:
+    player_scores = [
+        100.0 - profile.player_relevance.get(pid, 0.0)
+        for pid in players.values()
+    ]
+    edge_scores = []
+    for a, b in EDGES:
+        cid = edge_clubs[edge_key(a, b)]
+        edge_scores.append(
+            profile.edge_difficulty(index, players[a], players[b], cid)
+        )
+    return (
+        0.60 * (sum(player_scores) / len(player_scores))
+        + 0.40 * (sum(edge_scores) / len(edge_scores))
+    )
+
+
 @dataclass
 class Puzzle:
     players: Dict[str, int]
     edge_clubs: Dict[str, int]
     clue_nodes: list[str]
     blank_numbers: Dict[str, int]
+    difficulty: str = "random"
+    difficulty_score: float | None = None
 
     def serialise(self, index: CareerIndex) -> dict:
         player_payload = {}
@@ -98,8 +271,7 @@ class Puzzle:
 
         edges_payload = []
         for i, (a, b) in enumerate(EDGES):
-            key = edge_key(a, b)
-            cid = self.edge_clubs[key]
+            cid = self.edge_clubs[edge_key(a, b)]
             edges_payload.append(
                 {
                     "id": f"e{i}",
@@ -116,78 +288,104 @@ class Puzzle:
             "clues": self.clue_nodes,
             "blank_numbers": self.blank_numbers,
             "revealed": list(self.clue_nodes),
+            "difficulty": self.difficulty,
+            "difficulty_score": (
+                None
+                if self.difficulty_score is None
+                else round(self.difficulty_score, 1)
+            ),
         }
 
 
-def edge_key(a: str, b: str) -> str:
-    return "|".join(sorted((a, b)))
-
-
 def _random_clue_path(rng: random.Random) -> list[str]:
-    """
-    Reveal one player per row, connected all the way from top to bottom.
-    This mirrors the visual logic of the reference image and leaves 9 blanks.
-    """
+    # Kept for backwards compatibility; current UI starts at bottom.
     path = [node_id(0, 0)]
     current = path[0]
-
     for r in range(1, len(ROW_LENGTHS)):
         down = [
-            n
-            for n in ADJ[current]
+            n for n in ADJ[current]
             if int(n.split("c")[0][1:]) == r
         ]
         if not down:
-            raise RuntimeError("Topology error: clue path cannot continue")
+            raise RuntimeError("Topology error")
         current = rng.choice(down)
         path.append(current)
-
     return path
 
 
 def generate_puzzle(
     index: CareerIndex,
+    difficulty: str = "random",
     seed: int | None = None,
-    timeout_seconds: float = 20.0,
-    candidate_cap: int = 220,
-    restart_limit: int = 40,
+    timeout_seconds: float = 25.0,
+    candidate_cap: int = 240,
+    restart_limit: int = 50,
 ) -> Puzzle:
     """
-    Construct the COMPLETE valid 16-player solution first.
+    Complete 16-player CSP generator.
 
-    Constraints:
-      1. Every node is a different player.
-      2. Every connected pair shares exactly ONE senior club.
-      3. At a branching player, incident edges use different clubs.
-         This makes the route matter: taking the left or right edge from
-         a player gives a different club clue.
-      4. The full solution is built before any blank/reveal UI is shown.
+    Difficulty:
+      random    -> original unrestricted behaviour
+      easy      -> favours famous/recent players and obvious/prestigious links
+      medium    -> favours mid-range relevance and links
+      difficult -> favours less obvious players and links
+
+    Difficulty is a soft bias, not a brittle hard cutoff, so generation still
+    has enough freedom to complete a valid pyramid.
     """
+    difficulty = (difficulty or "random").lower()
+    if difficulty not in VALID_DIFFICULTIES:
+        raise ValueError(f"Unknown difficulty: {difficulty}")
+
     rng = random.Random(seed)
-    start_time = time.monotonic()
+    started = time.monotonic()
+    profile = build_difficulty_profile(index)
+    target = _target(difficulty)
 
     degrees = {n: len(ADJ[n]) for n in NODES}
-
-    # A player must have at least as many distinct career clubs as the number
-    # of differently-labelled incident edges we might need around that node.
-    eligible_for_degree: dict[int, list[int]] = {}
-    for d in sorted(set(degrees.values())):
-        eligible_for_degree[d] = [
-            pid
-            for pid, clubs in index.clubs_by_player.items()
+    eligible_for_degree = {
+        d: [
+            pid for pid, clubs in index.clubs_by_player.items()
             if len(clubs) >= d
         ]
+        for d in sorted(set(degrees.values()))
+    }
 
-    # Start at a high-degree middle node: it creates useful constraints early.
     max_degree = max(degrees.values())
     seed_nodes = [n for n, d in degrees.items() if d == max_degree]
 
-    def check_time() -> None:
-        if time.monotonic() - start_time > timeout_seconds:
+    def check_time():
+        if time.monotonic() - started > timeout_seconds:
             raise GenerationTimeout(
-                f"No pyramid found inside {timeout_seconds:.1f}s. "
-                "Try a broader player pool or a larger timeout."
+                f"No {difficulty} pyramid found inside {timeout_seconds:.1f}s. "
+                "Try again or increase PTP_GENERATION_TIMEOUT."
             )
+
+    def order_candidates(
+        player_ids: list[int],
+        assigned_neighbors: list[str],
+        assigned: dict[str, int],
+        shared_by_player: dict[int, list[int]],
+    ) -> list[int]:
+        result = list(player_ids)
+        if difficulty == "random":
+            rng.shuffle(result)
+            return result
+
+        ranked = []
+        for pid in result:
+            challenge = _candidate_challenge(
+                index,
+                profile,
+                pid,
+                assigned_neighbors,
+                assigned,
+                shared_by_player.get(pid, []),
+            )
+            distance = abs(challenge - target) + rng.random() * 4.0
+            ranked.append((distance, pid))
+        ranked.sort(key=lambda x: x[0])
+        return [pid for _, pid in ranked]
 
     for _restart in range(restart_limit):
         check_time()
@@ -198,22 +396,31 @@ def generate_puzzle(
         incident_clubs: dict[str, set[int]] = defaultdict(set)
 
         start_node = rng.choice(seed_nodes)
-        starters = eligible_for_degree[degrees[start_node]]
+        starters = list(eligible_for_degree[degrees[start_node]])
         if not starters:
-            raise RuntimeError("Player pool is too small for the pyramid.")
+            raise RuntimeError("Player pool is too small")
 
-        # Bias toward well-connected players, while keeping randomness.
-        starter_sample = (
-            rng.sample(starters, min(len(starters), 250))
-            if len(starters) > 250
-            else list(starters)
-        )
-        rng.shuffle(starter_sample)
+        sample = rng.sample(starters, min(len(starters), 450))
 
-        start_player = max(
-            starter_sample,
-            key=lambda pid: len(index.exact_neighbors(pid)),
-        )
+        if difficulty == "random":
+            start_player = max(
+                sample,
+                key=lambda pid: len(index.exact_neighbors(pid)),
+            )
+        else:
+            ranked = []
+            for pid in sample:
+                challenge = 100.0 - profile.player_relevance.get(pid, 0.0)
+                connectivity = min(250, len(index.exact_neighbors(pid)))
+                score = (
+                    abs(challenge - target)
+                    - connectivity * 0.01
+                    + rng.random() * 3.0
+                )
+                ranked.append((score, pid))
+            ranked.sort(key=lambda x: x[0])
+            start_player = ranked[0][1]
+
         assigned[start_node] = start_player
         used_players.add(start_player)
 
@@ -221,12 +428,16 @@ def generate_puzzle(
             assigned_neighbors = [n for n in ADJ[node] if n in assigned]
 
             if not assigned_neighbors:
-                # We normally won't use this because the graph is connected and
-                # we always expand from an assigned component.
-                pool = eligible_for_degree[degrees[node]]
+                pool = list(eligible_for_degree[degrees[node]])
                 if len(pool) > candidate_cap:
                     pool = rng.sample(pool, candidate_cap)
-                return [pid for pid in pool if pid not in used_players]
+                pool = [pid for pid in pool if pid not in used_players]
+                return order_candidates(
+                    pool,
+                    assigned_neighbors,
+                    assigned,
+                    {pid: [] for pid in pool},
+                )
 
             maps = [index.exact_neighbors(assigned[n]) for n in assigned_neighbors]
             candidate_ids = set(maps[0])
@@ -239,77 +450,61 @@ def generate_puzzle(
             candidate_ids.difference_update(used_players)
 
             valid = []
+            shared_by_player: dict[int, list[int]] = {}
+
             for pid in candidate_ids:
                 if len(index.clubs_by_player.get(pid, ())) < degrees[node]:
                     continue
 
-                proposed_clubs = []
+                proposed = []
                 ok = True
 
-                for neighbor, m in zip(assigned_neighbors, maps):
-                    cid = m.get(pid)
-                    if cid is None:
+                for neighbour, neighbour_map in zip(assigned_neighbors, maps):
+                    cid = neighbour_map.get(pid)
+                    if cid is None or cid in incident_clubs[neighbour]:
                         ok = False
                         break
-
-                    # The same player should not have two incident edges carrying
-                    # the same club clue. This is what makes each branch distinct.
-                    if cid in incident_clubs[neighbor]:
-                        ok = False
-                        break
-                    proposed_clubs.append(cid)
+                    proposed.append(cid)
 
                 if not ok:
                     continue
 
-                # If the new node touches multiple already-assigned neighbors,
-                # its incoming edge clubs must also be different from one another.
-                if len(proposed_clubs) != len(set(proposed_clubs)):
+                if len(proposed) != len(set(proposed)):
                     continue
 
-                # Leave enough distinct career clubs for the node's future edges.
                 future_edges = degrees[node] - len(assigned_neighbors)
-                remaining_club_capacity = (
-                    len(index.clubs_by_player[pid]) - len(set(proposed_clubs))
+                remaining_capacity = (
+                    len(index.clubs_by_player[pid]) - len(set(proposed))
                 )
-                if remaining_club_capacity < future_edges:
+                if remaining_capacity < future_edges:
                     continue
 
                 valid.append(pid)
+                shared_by_player[pid] = proposed
 
-            if len(valid) > candidate_cap:
-                valid = rng.sample(valid, candidate_cap)
-            else:
-                rng.shuffle(valid)
+            ordered = order_candidates(
+                valid,
+                assigned_neighbors,
+                assigned,
+                shared_by_player,
+            )
+            return ordered[:candidate_cap]
 
-            # Mildly prefer players that themselves have many exact-one-club links.
-            # We only score a small front slice to keep generation responsive.
-            if len(valid) > 1:
-                head = valid[: min(60, len(valid))]
-                head.sort(
-                    key=lambda pid: len(index.exact_neighbors(pid)),
-                    reverse=True,
-                )
-                # Blend ranked and random order so puzzles vary.
-                if rng.random() < 0.7:
-                    valid[: len(head)] = head
-
-            return valid
-
-        def choose_next_node() -> tuple[str | None, list[int]]:
+        def choose_next_node():
             unassigned = [n for n in NODES if n not in assigned]
             if not unassigned:
                 return None, []
 
             connected = [
-                n for n in unassigned if any(nb in assigned for nb in ADJ[n])
+                n for n in unassigned
+                if any(nb in assigned for nb in ADJ[n])
             ]
             if not connected:
                 connected = unassigned
 
             best_node = None
             best_domain = None
-            best_constraint_count = -1
+            best_constraints = -1
 
             for n in connected:
                 domain = candidate_domain(n)
@@ -323,12 +518,12 @@ def generate_puzzle(
                     or len(domain) < len(best_domain)
                     or (
                         len(domain) == len(best_domain)
-                        and constraint_count > best_constraint_count
+                        and constraint_count > best_constraints
                     )
                 ):
                     best_node = n
                     best_domain = domain
-                    best_constraint_count = constraint_count
+                    best_constraints = constraint_count
 
             return best_node, best_domain or []
 
@@ -350,34 +545,27 @@ def generate_puzzle(
                 check_time()
 
                 new_edges: list[tuple[str, str, int]] = []
-                valid = True
+                ok = True
 
-                for neighbor in assigned_neighbors:
-                    cid = index.exact_neighbors(assigned[neighbor]).get(pid)
+                for neighbour in assigned_neighbors:
+                    cid = index.exact_neighbors(assigned[neighbour]).get(pid)
                     if cid is None:
-                        valid = False
+                        ok = False
                         break
 
-                    # Exact-one-club relation is guaranteed by exact_neighbors,
-                    # but we keep an explicit invariant check for safety.
-                    if len(index.shared_clubs(assigned[neighbor], pid)) != 1:
-                        valid = False
+                    if len(index.shared_clubs(assigned[neighbour], pid)) != 1:
+                        ok = False
                         break
 
-                    if cid in incident_clubs[neighbor]:
-                        valid = False
-                        break
-                    if cid in incident_clubs[node]:
-                        valid = False
+                    if cid in incident_clubs[neighbour] or cid in incident_clubs[node]:
+                        ok = False
                         break
 
-                    new_edges.append((node, neighbor, cid))
+                    new_edges.append((node, neighbour, cid))
 
-                if not valid:
+                if not ok:
                     continue
 
-                # Multiple newly-created incident edges at this node must use
-                # different clubs.
                 cids = [cid for _, _, cid in new_edges]
                 if len(cids) != len(set(cids)):
                     continue
@@ -404,36 +592,42 @@ def generate_puzzle(
             return False
 
         if backtrack():
-            # Final defensive validation.
             if len(set(assigned.values())) != len(NODES):
                 raise AssertionError("Duplicate player in completed pyramid")
 
             for a, b in EDGES:
-                pa = assigned[a]
-                pb = assigned[b]
-                shared = index.shared_clubs(pa, pb)
+                shared = index.shared_clubs(assigned[a], assigned[b])
                 if len(shared) != 1:
                     raise AssertionError(
                         f"Invalid edge {a}-{b}: expected 1 shared club, got {len(shared)}"
                     )
-                cid = next(iter(shared))
-                edge_clubs[edge_key(a, b)] = cid
+                edge_clubs[edge_key(a, b)] = next(iter(shared))
 
             clues = _random_clue_path(rng)
             blanks = [n for n in NODES if n not in clues]
-
-            # Number blanks top-to-bottom, left-to-right.
             blank_numbers = {node: i + 1 for i, node in enumerate(blanks)}
+
+            final_score = (
+                None
+                if difficulty == "random"
+                else score_completed_puzzle(
+                    index,
+                    profile,
+                    assigned,
+                    edge_clubs,
+                )
+            )
 
             return Puzzle(
                 players=dict(assigned),
                 edge_clubs=dict(edge_clubs),
                 clue_nodes=clues,
                 blank_numbers=blank_numbers,
+                difficulty=difficulty,
+                difficulty_score=final_score,
             )
 
     raise GenerationTimeout(
-        "Could not construct a valid 16-player pyramid. "
-        "Try increasing timeout_seconds, reducing min_senior_appearances, "
-        "or using a broader player pool."
+        f"Could not construct a valid {difficulty} 16-player pyramid. "
+        "Try again or increase PTP_GENERATION_TIMEOUT."
     )
